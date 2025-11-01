@@ -1,0 +1,237 @@
+for i in {1..3}; do
+  docker exec -it java-kafka-1 kafka-topics --create \
+    --bootstrap-server localhost:9092 \
+    --replication-factor 1 \
+    --partitions 3 \
+    --topic transactions_institution$i
+done
+
+
+JAR_NAME=$(ls target/transaction-monitoring-*.jar | xargs -n 1 basename)
+docker cp target/$JAR_NAME java-flink-jobmanager-1:/opt/flink/
+docker exec -it java-flink-jobmanager-1 ./bin/flink run -d /opt/flink/$JAR_NAME
+
+
+docker-compose.txt(works but restarts)
+version: '3.8'
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      - kafka
+
+  flink-jobmanager:
+    image: flink:1.17.0
+    ports:
+      - "8081:8081"
+      - "6123:6123"
+    environment:
+      - FLINK_PROPERTIES=jobmanager.rpc.address:flink-jobmanager
+    depends_on:
+      - kafka
+    command: bash -c "bin/start-cluster.sh && tail -f /dev/null"  # Changed command
+
+  flink-taskmanager:
+    image: flink:1.17.0
+    depends_on:
+      - flink-jobmanager
+    mem_limit: 2g      # limit memory to 2GB
+    cpus: 2            # limit CPU cores to 2
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.registration.timeout: 5 min
+        taskmanager.memory.process.size: 1600m
+        heartbeat.timeout: 60000
+        heartbeat.interval: 10000
+      TASK_MANAGER_NUMBER_OF_TASK_SLOTS: 2
+    command: bash -c "bin/taskmanager.sh start-foreground"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/taskmanagers"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+
+transmonitor.java
+// src/main/java/com/yourcompany/TransactionMonitoringJob.java
+package com.yourcompany;
+
+import java.util.regex.Pattern;
+import org.apache.flink.api.common.eventtime.TimestampAssigner;
+import org.apache.flink.api.common.eventtime.TimestampAssignerSupplier;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.functions.FilterFunction;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.windowing.assigners.SlidingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.api.java.functions.KeySelector;
+import org.apache.flink.streaming.api.functions.windowing.WindowFunction;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
+import org.apache.flink.util.Collector;
+import org.json.JSONObject;
+
+import java.time.Duration;
+
+public class TransactionMonitoringJob {
+    
+    public static void main(String[] args) throws Exception {
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        
+        // Set checkpointing for fault tolerance
+        env.enableCheckpointing(5000); // Checkpoint every 5 seconds
+        
+        // Kafka source configuration with internal Docker address
+        KafkaSource<String> source = KafkaSource.<String>builder()
+            .setBootstrapServers("kafka:9092")  // Fixed: Use internal Docker network address
+            .setTopics("transactions_institution1", "transactions_institution2", "transactions_institution3")
+            .setGroupId("flink-transaction-monitoring")
+            .setStartingOffsets(OffsetsInitializer.earliest())
+            .setValueOnlyDeserializer(new SimpleStringSchema())
+            .build();
+        
+        // Create stream from Kafka
+        DataStream<String> kafkaTransactions = env.fromSource(
+            source,
+            WatermarkStrategy.forBoundedOutOfOrderness(Duration.ofSeconds(5)),
+            "Kafka Source")
+            .map(message -> {
+            System.out.println("[DEBUG] Received Kafka message: " + message); // Add this
+            return message;
+        });
+        
+        // Parse JSON and convert to Transaction objects
+        DataStream<Transaction> transactions = kafkaTransactions
+            .map(new ParseJSON());
+            
+        // Add timestamps and watermarks
+        DataStream<Transaction> timestampedTransactions = transactions
+            .assignTimestampsAndWatermarks(
+                WatermarkStrategy.<Transaction>forBoundedOutOfOrderness(Duration.ofSeconds(5))
+            .withTimestampAssigner(new TimestampAssignerSupplier<Transaction>() {
+                @Override
+                public TimestampAssigner<Transaction> createTimestampAssigner(Context context) {
+                    return (event, timestamp) -> event.getTimestamp();
+                }
+            })
+    );
+        
+        // 1. Large transaction alert (> $5000)
+        timestampedTransactions
+            .filter(new FilterFunction<Transaction>() {
+                @Override
+                public boolean filter(Transaction t) throws Exception {
+                    return t.getAmount() > 5000;
+                }
+            })
+            .map(new MapFunction<Transaction, String>() {
+                @Override
+                public String map(Transaction t) throws Exception {
+                    return String.format("🚨 Large transaction alert: $%,.2f from %s", 
+                            t.getAmount(), t.getInstitutionId());
+                }
+            })
+            .print();
+        
+        // 2. Sliding window aggregation (5min window sliding every 1min)
+        timestampedTransactions
+            .keyBy(new KeySelector<Transaction, String>() {
+                @Override
+                public String getKey(Transaction t) throws Exception {
+                    return t.getInstitutionId();
+                }
+            })
+            .window(SlidingEventTimeWindows.of(Time.minutes(5), Time.minutes(1)))
+            .apply(new WindowFunction<Transaction, String, String, TimeWindow>() {
+                @Override
+                public void apply(String institutionId, TimeWindow window, 
+                        Iterable<Transaction> transactions, Collector<String> out) throws Exception {
+                    double sum = 0;
+                    int count = 0;
+                    for (Transaction t : transactions) {
+                        sum += t.getAmount();
+                        count++;
+                    }
+                    if (sum > 10000) {
+                        out.collect(String.format(
+                            "⚠️ Transaction spike detected for %s: $%,.2f in last 5min (%d transactions)",
+                            institutionId, sum, count));
+                    }
+                }
+            })
+            .print();
+        
+        env.execute("Transaction Monitoring");
+    }
+    
+    // Helper class to parse JSON transactions
+    public static class ParseJSON implements MapFunction<String, Transaction> {
+        @Override
+        public Transaction map(String value) throws Exception {
+            System.out.println("[DEBUG] Parsing JSON: " + value);
+            JSONObject json = new JSONObject(value);
+            return new Transaction(
+                json.getString("transaction_id"),
+                json.getString("institution_id"),
+                json.getDouble("amount"),
+                json.getLong("timestamp")  // Changed to long
+            );
+        }
+    }
+    
+    // Transaction POJO with timestamp as long
+    public static class Transaction {
+        private String transactionId;
+        private String institutionId;
+        private double amount;
+        private long timestamp;  // Changed to long
+        
+        public Transaction(String transactionId, String institutionId, double amount, long timestamp) {
+            this.transactionId = transactionId;
+            this.institutionId = institutionId;
+            this.amount = amount;
+            this.timestamp = timestamp;
+        }
+        
+        // Getters
+        public String getTransactionId() { return transactionId; }
+        public String getInstitutionId() { return institutionId; }
+        public double getAmount() { return amount; }
+        public long getTimestamp() { return timestamp; }  // Returns long
+    }
+}

@@ -1,0 +1,75 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      - kafka
+
+  flink-jobmanager:
+    image: flink:1.16.2-scala_2.12
+    ports:
+      - "8081:8081"
+      - "6123:6123"
+    environment:
+      - FLINK_PROPERTIES=jobmanager.rpc.address:flink-jobmanager
+      - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+      - REST_ADDRESS=flink-jobmanager
+    depends_on:
+      - kafka
+    command: bash -c "bin/start-cluster.sh && tail -f /dev/null"  # Changed command
+
+  flink-taskmanager:
+    image: flink:1.16.2-scala_2.12
+    depends_on:
+      - flink-jobmanager
+    mem_limit: 2g      # limit memory to 2GB
+    cpus: 2            # limit CPU cores to 2
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.registration.timeout: 5 min
+        taskmanager.memory.process.size: 1600m
+        heartbeat.timeout: 60000
+        heartbeat.interval: 10000
+      TASK_MANAGER_NUMBER_OF_TASK_SLOTS: 2
+    command: bash -c "bin/taskmanager.sh start-foreground"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/taskmanagers"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+networks:
+  default:
+    name: flink-kafka-network
+    driver: bridge
+

@@ -7,7 +7,6 @@ services:
 
   kafka:
     image: confluentinc/cp-kafka:7.3.0
-
     depends_on:
       - zookeeper
     ports:
@@ -44,14 +43,14 @@ services:
       - REST_ADDRESS=flink-jobmanager
     depends_on:
       - kafka
-    command: bash -c "bin/start-cluster.sh && tail -f /dev/null"  # Changed command
+    command: bash -c "bin/start-cluster.sh && tail -f /dev/null"
 
   flink-taskmanager:
     image: flink:1.16.2-scala_2.12
     depends_on:
       - flink-jobmanager
-    mem_limit: 2g      # limit memory to 2GB
-    cpus: 2            # limit CPU cores to 2
+    mem_limit: 2g
+    cpus: 2
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
@@ -67,11 +66,6 @@ services:
       timeout: 10s
       retries: 3
     restart: unless-stopped
-
-networks:
-  default:
-    name: flink-kafka-network
-    driver: bridge
 
   postgres:
     image: postgres:14
@@ -91,6 +85,11 @@ networks:
     ports:
       - "6379:6379"
     command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+networks:
+  default:
+    name: flink-kafka-network
+    driver: bridge
 
 volumes:
   postgres_data:

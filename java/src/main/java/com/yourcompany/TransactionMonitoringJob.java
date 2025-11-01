@@ -147,3 +147,35 @@ public class TransactionMonitoringJob {
         public long getTimestamp() { return timestamp; }
     }
 }
+
+timestampedTransactions
+    .addSink(new RichSinkFunction<Transaction>() {
+        private transient Connection conn;
+        private transient PreparedStatement stmt;
+
+        @Override
+        public void open(Configuration parameters) throws Exception {
+            conn = DriverManager.getConnection(
+                "jdbc:postgresql://postgres-db:5432/transactions_db",
+                "flinkuser", "flinkpass"
+            );
+            stmt = conn.prepareStatement(
+                "INSERT INTO transactions (transaction_id, institution_id, amount, timestamp) VALUES (?, ?, ?, ?)"
+            );
+        }
+
+        @Override
+        public void invoke(Transaction t, Context context) throws Exception {
+            stmt.setString(1, t.getTransactionId());
+            stmt.setString(2, t.getInstitutionId());
+            stmt.setDouble(3, t.getAmount());
+            stmt.setLong(4, t.getTimestamp());
+            stmt.executeUpdate();
+        }
+
+        @Override
+        public void close() throws Exception {
+            stmt.close();
+            conn.close();
+        }
+    });
